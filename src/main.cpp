@@ -51,7 +51,13 @@ void strategy_thread(int core_id) {
 // ---------------------------------------------------------
 // MAIN EXECUTION
 // ---------------------------------------------------------
-int main() {
+int main(int argc, char* argv[]) {
+
+    int NUM_CONSUMERS = 1; 
+    if (argc > 1) {
+        NUM_CONSUMERS = std::stoi(argv[1]);
+    }
+
     // 1. Pin the main thread (Producer) to Core 0
     pin_thread_to_core(0);
     std::cout << "[System] Producer thread pinned to Core 0.\n";
@@ -74,11 +80,10 @@ int main() {
     file.close();
 
     // 3. Spawn Consumer Strategy Threads on isolated cores
-    const int NUM_CONSUMERS = 2;
+    std::cout << "[System] Spawning " << NUM_CONSUMERS << " Strategy Threads...\n";
     std::vector<std::thread> consumers;
     for (int i = 1; i <= NUM_CONSUMERS; ++i) {
         consumers.emplace_back(strategy_thread, i);
-        std::cout << "[System] Spawned Strategy Thread on Core " << i << ".\n";
     }
 
     // 4. Start the Producer Benchmark
@@ -115,9 +120,12 @@ int main() {
 
     // 6. Output Metrics
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    double duration_sec = duration_ms / 1000.0;
+    double mpps = (num_messages / 1000000.0) / (duration_sec > 0 ? duration_sec : 0.001);
     
-    std::cout << "\n--- PERFORMANCE LOG ---\n";
+    std::cout << "\n--- PERFORMANCE LOG (" << NUM_CONSUMERS << " CONSUMERS) ---\n";
     std::cout << "Total Time       : " << duration_ms << " ms\n";
+    std::cout << "Throughput       : " << mpps << " Mpps\n";
     std::cout << "Producer Pushed  : " << producer_pushed << " messages\n";
     std::cout << "Consumers Read   : " << total_consumed.load() << " messages\n";
     std::cout << "Data Integrity   : " << (producer_pushed == total_consumed.load() ? "PASSED" : "FAILED") << "\n";

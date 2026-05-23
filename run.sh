@@ -18,3 +18,4 @@ make -j$(nproc)
 echo "=== Execution Start ==="
 # Run the compiled binary
 ./simd_nanoring
+./run_experiments

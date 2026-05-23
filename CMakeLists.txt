@@ -20,3 +20,6 @@ add_executable(simd_nanoring src/main.cpp)
 # Explicitly tell the compiler where to find your remaining headers
 # (simd_parser.h and ring_buffer.h)
 target_include_directories(simd_nanoring PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+add_executable(run_experiments src/experiments.cpp)
+target_include_directories(run_experiments PRIVATE ${CMAKE_SOURCE_DIR}/include)

@@ -1,25 +1,21 @@
-# ---------------------------------------------------
-# SIMD NanoRing .gitignore
-# ---------------------------------------------------
-
-# 1. Market Data & Logs (Crucial)
-*.bin
-*.gz
-*.pcap
-wget-log*
-
-# 2. CMake Build Directory
+# Build artifacts
 /build/
 CMakeCache.txt
 CMakeFiles/
 Makefile
 cmake_install.cmake
 
-# 3. Compiled Executables
-simd_nanoring
-generate_mock_data
+# Binary data
+*.bin
+*.gz
+*.pcap
 
-# 4. IDE / OS Files
+# Compiled executables
+simd_nanoring
+run_experiments
+generate_data
+
+# IDE / OS
 .vscode/
 .idea/
 .DS_Store

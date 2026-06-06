@@ -1,49 +1,58 @@
 #pragma once
 #include <atomic>
 #include <vector>
-#include "simd_parser.h" 
+#include <cstddef>
 
 // The Zero-Copy Broadcast Architecture (LMAX Disruptor Pattern)
+// Templatized on capacity; payload type is determined by the journal's vector element.
+// Consumers only READ the published index → MESI cache line stays in Shared (S) state.
 template <size_t Capacity>
 class BroadcastJournal {
 private:
-    // Capacity must be a power of 2 for fast bitwise modulo
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2");
     static constexpr size_t Mask = Capacity - 1;
 
-    std::vector<Itch5AddOrder> journal;
+    // Use a flat byte array to avoid requiring default-constructible payloads
+    struct alignas(64) Slot {
+        alignas(8) char data[64]; // large enough for DecodedOrder (≤48 bytes)
+    };
 
-    // CRITICAL: The single source of truth. 
-    // alignas(64) isolates this atomic on its own L1 cache line to prevent False Sharing.
-    alignas(64) std::atomic<size_t> published_index{0};
+    std::vector<Slot> journal_;
+
+    // Single source of truth: the monotonically increasing sequence number.
+    // alignas(64) isolates on its own cache line to prevent false sharing.
+    alignas(64) std::atomic<size_t> published_index_{0};
+
+    // Pad to prevent consumer reads from sharing the producer's cache line
+    alignas(64) char pad_[64] = {};
 
 public:
-    BroadcastJournal() : journal(Capacity) {}
+    BroadcastJournal() : journal_(Capacity) {}
 
-    // ---------------------------------------------------------
-    // PRODUCER (Core 0)
-    // ---------------------------------------------------------
-    inline void publish(size_t sequence, const Itch5AddOrder& item) {
-        // 1. Write the payload to the central arena
-        journal[sequence & Mask] = item;
-        
-        // 2. The Sequence Barrier
-        // memory_order_release guarantees the payload is fully committed to RAM 
-        // BEFORE the consumers are allowed to see the updated index.
-        published_index.store(sequence + 1, std::memory_order_release);
+    // PRODUCER: Write payload then release-fence the index
+    template <typename T>
+    inline void publish(size_t sequence, const T& item) {
+        static_assert(sizeof(T) <= sizeof(Slot), "Payload exceeds slot size");
+        __builtin_memcpy(&journal_[sequence & Mask], &item, sizeof(T));
+
+        // Release: payload committed before consumers see updated index
+        published_index_.store(sequence + 1, std::memory_order_release);
     }
 
-    // ---------------------------------------------------------
-    // CONSUMERS (Cores 1 to N)
-    // ---------------------------------------------------------
-    // Consumers spin-wait on this function.
-    // Because they only READ, the MESI protocol keeps this cache line in the Shared (S) state.
+    // CONSUMER: Acquire-load the published index (read-only, MESI Shared state)
     inline size_t get_published_index() const {
-        return published_index.load(std::memory_order_acquire);
+        return published_index_.load(std::memory_order_acquire);
     }
 
-    // O(1) Payload Retrieval
-    inline const Itch5AddOrder& get_payload(size_t sequence) const {
-        return journal[sequence & Mask];
+    // CONSUMER: O(1) zero-copy payload retrieval
+    template <typename T>
+    inline const T& get_payload(size_t sequence) const {
+        return *reinterpret_cast<const T*>(&journal_[sequence & Mask]);
+    }
+
+    // Non-template convenience for the common case
+    template <typename T>
+    inline void publish_typed(size_t sequence, const T& item) {
+        publish(sequence, item);
     }
 };

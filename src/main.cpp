@@ -1,135 +1,153 @@
 #include <iostream>
-#include <fstream>
 #include <vector>
-#include <thread>
-#include <atomic>
 #include <chrono>
-#include <pthread.h>
 #include <cstring>
-#include "ring_buffer.h" // This includes simd_parser.h and the Itch5AddOrder struct
+#include <random>
+#include <iomanip>
 
-// Global lock-free ring buffer with a power-of-2 capacity
-LockFreeRingBuffer<65536> ring_buffer;
+#include "itch_messages.h"
+#include "simd_decoder.h"
+#include "pipeline.h"
 
-// Atomic flag to cleanly shut down consumer threads when the producer finishes
-std::atomic<bool> producer_finished{false};
-std::atomic<size_t> total_consumed{0};
+static const char* TICKERS[] = {
+    "AAPL    ", "MSFT    ", "TSLA    ", "GOOG    ",
+    "AMZN    ", "NFLX    ", "META    ", "NVDA    ",
+    "AMD     ", "INTC    ", "JPM     ", "BAC     ",
+    "WMT     ", "DIS     ", "ORCL    ", "CRM     ",
+    "PYPL    ", "UBER    ", "SQ      ", "SNAP    ",
+    "BABA    ", "JD      ", "PDD     ", "NIO     ",
+    "PLTR    ", "COIN    ", "HOOD    ", "SOFI    ",
+    "RIVN    ", "LCID    ", "F       ", "GM      ",
+    "BA      ", "LMT     ", "RTX     ", "NOC     ",
+    "XOM     ", "CVX     ", "COP     ", "SLB     ",
+    "PFE     ", "JNJ     ", "UNH     ", "ABBV    ",
+    "MRK     ", "LLY     ", "TMO     ", "ABT     ",
+    "V       ", "MA      ", "AXP     ", "GS      ",
+    "MS      ", "C       ", "WFC     ", "USB     ",
+    "T       ", "VZ      ", "TMUS    ", "CMCSA   ",
+    "ROKU    ", "SPOT    ", "ZM      ", "DOCU    "
+};
+static constexpr size_t NUM_TICKERS = sizeof(TICKERS) / sizeof(TICKERS[0]);
 
-// Helper function to pin a thread to a specific physical CPU core
-void pin_thread_to_core(int core_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-}
-
-// ---------------------------------------------------------
-// CONSUMER: Strategy Thread (Runs on Cores 1, 2, etc.)
-// ---------------------------------------------------------
-void strategy_thread(int core_id) {
-    pin_thread_to_core(core_id);
-    
-    Itch5AddOrder incoming_trade;
-    size_t local_consumed = 0;
-
-    // Spin-wait loop: The thread never sleeps, constantly polling the atomic read index
-    while (!producer_finished.load(std::memory_order_relaxed)) {
-        if (ring_buffer.pop(incoming_trade)) {
-            // In a real system, you would execute your trading algorithm here based on incoming_trade.price
-            local_consumed++;
-        }
-    }
-
-    // Drain any remaining items after the producer signals completion
-    while (ring_buffer.pop(incoming_trade)) {
-        local_consumed++;
-    }
-
-    total_consumed.fetch_add(local_consumed, std::memory_order_relaxed);
-}
-
-// ---------------------------------------------------------
-// MAIN EXECUTION
-// ---------------------------------------------------------
 int main(int argc, char* argv[]) {
+    size_t num_messages = 20000000;
+    size_t num_threads = 4;
 
-    int NUM_CONSUMERS = 1; 
-    if (argc > 1) {
-        NUM_CONSUMERS = std::stoi(argv[1]);
+    if (argc > 1) num_threads = std::stoul(argv[1]);
+    if (argc > 2) num_messages = std::stoul(argv[2]);
+
+    std::cout << "╔══════════════════════════════════════════════════╗\n";
+    std::cout << "║     SIMD NanoRing — Pipeline Market Data Engine  ║\n";
+    std::cout << "╚══════════════════════════════════════════════════╝\n\n";
+
+    std::cout << "[Config] Messages: " << num_messages / 1000000 << "M"
+              << " | Book Threads: " << num_threads
+              << " | Symbols: " << NUM_TICKERS << "\n";
+    std::cout << "[Platform] " <<
+#if defined(__aarch64__)
+        "ARM64 NEON"
+#elif defined(__x86_64__)
+        "x86-64 AVX2"
+#else
+        "Scalar"
+#endif
+        << " | HW Threads: " << std::thread::hardware_concurrency() << "\n\n";
+
+    // --- Stage 0: Generate realistic market data ---
+    std::cout << "[Stage 0] Generating " << num_messages / 1000000 << "M order messages...\n";
+    std::vector<ItchAddOrder> raw_messages(num_messages);
+    std::vector<DecodedOrder> decoded(num_messages);
+
+    std::mt19937 gen(42);
+    std::uniform_int_distribution<size_t> ticker_dist(0, NUM_TICKERS - 1);
+    std::uniform_int_distribution<uint32_t> price_dist(100000, 500000);
+    std::uniform_int_distribution<uint32_t> shares_dist(1, 1000);
+    std::uniform_int_distribution<int> side_dist(0, 1);
+    std::uniform_int_distribution<int> type_dist(0, 9);
+
+    uint64_t next_ref = 1;
+    for (size_t i = 0; i < num_messages; i++) {
+        size_t tidx = ticker_dist(gen);
+        raw_messages[i].message_type = 'A';
+        raw_messages[i].order_ref_num = next_ref++;
+        raw_messages[i].buy_sell_indicator = side_dist(gen) ? 'B' : 'S';
+        raw_messages[i].shares = __builtin_bswap32(shares_dist(gen));
+        std::memcpy(raw_messages[i].stock, TICKERS[tidx], 8);
+        raw_messages[i].price = __builtin_bswap32(price_dist(gen));
     }
 
-    // 1. Pin the main thread (Producer) to Core 0
-    pin_thread_to_core(0);
-    std::cout << "[System] Producer thread pinned to Core 0.\n";
+    // --- Stage 1: SIMD Decode ---
+    std::cout << "[Stage 1] SIMD Decoding " << num_messages / 1000000 << "M messages...\n";
+    auto decode_start = std::chrono::high_resolution_clock::now();
 
-    // 2. Load the mock data into memory
-    const char* filename = "../mock_itch50.bin"; 
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file) {
-        std::cerr << "Fatal Error: Failed to open " << filename << "\n";
-        return 1;
-    }
+    size_t num_decoded = SimdDecoder::decode_add_orders_simd(
+        raw_messages.data(), num_messages, decoded.data());
 
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    size_t num_messages = size / sizeof(Itch5AddOrder);
-    std::vector<Itch5AddOrder> market_data(num_messages);
-
-    std::cout << "[System] Loading " << num_messages << " messages into RAM...\n";
-    file.read(reinterpret_cast<char*>(market_data.data()), size);
-    file.close();
-
-    // 3. Spawn Consumer Strategy Threads on isolated cores
-    std::cout << "[System] Spawning " << NUM_CONSUMERS << " Strategy Threads...\n";
-    std::vector<std::thread> consumers;
-    for (int i = 1; i <= NUM_CONSUMERS; ++i) {
-        consumers.emplace_back(strategy_thread, i);
-    }
-
-    // 4. Start the Producer Benchmark
-    uint64_t target_ticker;
-    std::memcpy(&target_ticker, "AAPL    ", 8);
-
-    std::cout << "\n[Benchmark] Firing data through SIMD Parser to the Ring Buffer...\n";
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    // SIMD Parsing & Pushing Logic
-    // (In a fully integrated setup, the push() happens inside the parse_batch loop upon a bitmask match)
-    size_t producer_pushed = 0;
-    for (size_t i = 0; i < num_messages; ++i) {
-        // Simulating the bitmask match for AAPL
-        uint64_t current_ticker;
-        std::memcpy(&current_ticker, market_data[i].stock, 8);
-        
-        if (current_ticker == target_ticker) {
-            // Spin until the buffer has space to push the payload
-            while (!ring_buffer.push(market_data[i])) {
-                // Spin-wait (Buffer is full)
-            }
-            producer_pushed++;
+    // Assign realistic message types for book variety
+    for (size_t i = 0; i < num_decoded; i++) {
+        int roll = type_dist(gen);
+        if (roll <= 5) decoded[i].type = DecodedOrder::Type::Add;
+        else if (roll <= 7) decoded[i].type = DecodedOrder::Type::Execute;
+        else if (roll == 8) decoded[i].type = DecodedOrder::Type::Delete;
+        else {
+            decoded[i].type = DecodedOrder::Type::Replace;
+            decoded[i].new_order_ref = next_ref++;
         }
     }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    
-    // 5. Signal completion and join threads
-    producer_finished.store(true, std::memory_order_release);
-    for (auto& t : consumers) {
-        t.join();
+    auto decode_end = std::chrono::high_resolution_clock::now();
+    double decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+    double decode_mpps = (num_decoded / 1e6) / (decode_ms / 1000.0);
+
+    std::cout << "         Decoded: " << num_decoded << " messages in "
+              << std::fixed << std::setprecision(2) << decode_ms << " ms ("
+              << decode_mpps << " Mpps)\n\n";
+
+    // --- Stage 2+3: Pipeline (Journal → Sharded Books) ---
+    std::cout << "[Stage 2] Broadcasting via zero-copy journal...\n";
+    std::cout << "[Stage 3] " << num_threads << " sharded book threads processing...\n\n";
+
+    Pipeline::Config cfg;
+    cfg.num_book_threads = num_threads;
+    cfg.measure_latency = true;
+
+    Pipeline pipeline(cfg);
+    auto results = pipeline.run(decoded.data(), num_decoded);
+
+    // --- Results ---
+    std::cout << "┌──────────────────────────────────────────────────┐\n";
+    std::cout << "│              PERFORMANCE RESULTS                  │\n";
+    std::cout << "├──────────────────────────────────────────────────┤\n";
+    std::cout << "│ Total Pipeline Time : " << std::setw(10) << std::fixed
+              << std::setprecision(2) << results.total_time_ms << " ms          │\n";
+    std::cout << "│ Throughput          : " << std::setw(10) << std::fixed
+              << std::setprecision(2) << results.throughput_mpps << " Mpps        │\n";
+    std::cout << "│ Decode Stage        : " << std::setw(10) << std::fixed
+              << std::setprecision(2) << decode_ms << " ms          │\n";
+    std::cout << "├──────────────────────────────────────────────────┤\n";
+    std::cout << "│ Per-Thread Message Distribution:                  │\n";
+
+    for (size_t t = 0; t < results.thread_message_counts.size(); t++) {
+        std::cout << "│   Thread " << t << ": " << std::setw(10)
+                  << results.thread_message_counts[t] << " msgs ("
+                  << std::fixed << std::setprecision(2)
+                  << results.thread_throughputs[t] << " Mpps)  │\n";
     }
 
-    // 6. Output Metrics
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    double duration_sec = duration_ms / 1000.0;
-    double mpps = (num_messages / 1000000.0) / (duration_sec > 0 ? duration_sec : 0.001);
-    
-    std::cout << "\n--- PERFORMANCE LOG (" << NUM_CONSUMERS << " CONSUMERS) ---\n";
-    std::cout << "Total Time       : " << duration_ms << " ms\n";
-    std::cout << "Throughput       : " << mpps << " Mpps\n";
-    std::cout << "Producer Pushed  : " << producer_pushed << " messages\n";
-    std::cout << "Consumers Read   : " << total_consumed.load() << " messages\n";
-    std::cout << "Data Integrity   : " << (producer_pushed == total_consumed.load() ? "PASSED" : "FAILED") << "\n";
-    std::cout << "-----------------------\n";
+    std::cout << "└──────────────────────────────────────────────────┘\n";
+
+    // Latency (if measured)
+    if (results.latency.count > 0) {
+        results.latency.sort_samples();
+        std::cout << "\n┌──────────────────────────────────────────────────┐\n";
+        std::cout << "│              LATENCY PERCENTILES                  │\n";
+        std::cout << "├──────────────────────────────────────────────────┤\n";
+        std::cout << "│ P50   : " << std::setw(8) << results.latency.percentile(0.50) << " ns                        │\n";
+        std::cout << "│ P90   : " << std::setw(8) << results.latency.percentile(0.90) << " ns                        │\n";
+        std::cout << "│ P99   : " << std::setw(8) << results.latency.percentile(0.99) << " ns                        │\n";
+        std::cout << "│ P99.9 : " << std::setw(8) << results.latency.percentile(0.999) << " ns                        │\n";
+        std::cout << "└──────────────────────────────────────────────────┘\n";
+    }
 
     return 0;
 }

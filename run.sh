@@ -1,21 +1,18 @@
 #!/bin/bash
-
-# Exit immediately if a command exits with a non-zero status
 set -e
 
 echo "=== Building SIMD NanoRing ==="
 
-# Create build directory if it doesn't exist
 mkdir -p build
 cd build
-
-# Generate the Makefile via CMake
 cmake ..
+make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+cd ..
 
-# Compile the code using all available CPU cores
-make -j$(nproc)
+echo ""
+echo "=== Running Pipeline Demo ==="
+./build/simd_nanoring 4 20000000
 
-echo "=== Execution Start ==="
-# Run the compiled binary
-./simd_nanoring
-./run_experiments
+echo ""
+echo "=== Running Experiment Suite ==="
+./build/run_experiments

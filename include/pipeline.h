@@ -35,7 +35,8 @@ static inline void pin_to_core([[maybe_unused]] int core_id) {
 #endif
 }
 
-// Latency measurement via monotonic high-resolution clock
+// Latency measurement: stores per-message publish timestamps so consumers
+// can compute true end-to-end (producer-publish → consumer-read) latency.
 struct LatencyTracker {
     static constexpr size_t MAX_SAMPLES = 1000000;
 
@@ -102,9 +103,14 @@ public:
         std::vector<ShardedBookManager> shard_managers(config_.num_book_threads);
         std::vector<std::thread> consumers;
 
+        // Per-message publish timestamps for true end-to-end latency
+        std::vector<uint64_t> publish_ts;
+        if (config_.measure_latency) {
+            publish_ts.resize(num_orders, 0);
+        }
+
         // Assign symbol shards: symbol hash % num_threads
         auto get_shard = [this](uint64_t ticker_key) -> size_t {
-            // FNV-1a inspired hash for uniform distribution
             uint64_t h = ticker_key * 0x9E3779B97F4A7C15ULL;
             h ^= (h >> 33);
             return h % config_.num_book_threads;
@@ -113,6 +119,7 @@ public:
         // --- STAGE 2: Book Builder Threads ---
         auto start_time = std::chrono::high_resolution_clock::now();
 
+        // Thread 0 also does latency measurement (first consumer to read)
         for (size_t t = 0; t < config_.num_book_threads; t++) {
             consumers.emplace_back([&, t]() {
                 pin_to_core(static_cast<int>(t + 1));
@@ -132,17 +139,30 @@ public:
                         continue;
                     }
 
-                    // Drain all available messages
                     while (local_seq < published) {
                         const DecodedOrder& order = journal.get_payload<DecodedOrder>(local_seq);
 
-                        // Only process orders belonging to this shard
                         if (get_shard(order.ticker_key) == t) {
                             shard_managers[t].apply(order);
                             local_count++;
+
+                            // True e2e latency: consumer read time - producer publish time
+                            if (config_.measure_latency && t == 0 && (local_seq % 1000 == 0)) {
+                                auto now = std::chrono::high_resolution_clock::now();
+                                uint64_t consume_ns = static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        now - start_time).count());
+                                uint64_t pub_ns = publish_ts[local_seq];
+                                if (consume_ns > pub_ns) {
+                                    results.latency.record(consume_ns - pub_ns);
+                                }
+                            }
                         }
                         local_seq++;
                     }
+
+                    // Report progress for backpressure support
+                    journal.report_consumer_progress(local_seq);
                 }
 
                 results.thread_message_counts[t] = local_count;
@@ -153,15 +173,13 @@ public:
         auto decode_start = std::chrono::high_resolution_clock::now();
 
         for (size_t i = 0; i < num_orders; i++) {
-            journal.publish(i, orders[i]);
-
-            // Optional latency sampling every 1000th message
-            if (config_.measure_latency && (i % 1000 == 0)) {
+            if (config_.measure_latency) {
                 auto now = std::chrono::high_resolution_clock::now();
-                auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    now - start_time).count();
-                results.latency.record(static_cast<uint64_t>(ns));
+                publish_ts[i] = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - start_time).count());
             }
+            journal.publish(i, orders[i]);
         }
 
         auto decode_end = std::chrono::high_resolution_clock::now();

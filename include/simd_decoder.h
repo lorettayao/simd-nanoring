@@ -1,5 +1,6 @@
 #pragma once
 #include "itch_messages.h"
+#include <array>
 #include <cstddef>
 #include <cstring>
 
@@ -24,6 +25,34 @@ public:
     // Decode a batch of raw ITCH binary messages into DecodedOrder structs.
     // Returns the number of messages successfully decoded.
     // The input is a flat byte stream with 2-byte big-endian length prefixes.
+    // Function pointer table indexed by message type — eliminates branch
+    // misprediction from switch/case on random message mix.
+    using DecodeFn = void(*)(const uint8_t*, DecodedOrder&);
+
+    static inline DecodeFn get_handler(char msg_type) {
+        static const auto table = []() {
+            std::array<DecodeFn, 256> t{};
+            t['A'] = decode_add_order;
+            t['D'] = decode_delete;
+            t['E'] = decode_execute;
+            t['U'] = decode_replace;
+            return t;
+        }();
+        return table[static_cast<uint8_t>(msg_type)];
+    }
+
+    static inline size_t min_msg_size(char msg_type) {
+        static const auto table = []() {
+            std::array<size_t, 256> t{};
+            t['A'] = ITCH_ADD_ORDER_SIZE;
+            t['D'] = ITCH_ORDER_DELETE_SIZE;
+            t['E'] = ITCH_ORDER_EXECUTED_SIZE;
+            t['U'] = ITCH_ORDER_REPLACE_SIZE;
+            return t;
+        }();
+        return table[static_cast<uint8_t>(msg_type)];
+    }
+
     static size_t decode_stream(const uint8_t* stream, size_t stream_len,
                                 DecodedOrder* output, size_t max_output) {
         size_t offset = 0;
@@ -36,36 +65,18 @@ public:
 
             if (offset + msg_len > stream_len) break;
 
-            char msg_type = static_cast<char>(stream[offset]);
+            // Prefetch next message's cache line while processing current one.
+            // Variable-length messages defeat the HW prefetcher's stride detection.
+            __builtin_prefetch(stream + offset + msg_len, 0, 1);
 
-            switch (msg_type) {
-                case 'A': {
-                    if (msg_len < ITCH_ADD_ORDER_SIZE) { offset += msg_len; continue; }
-                    decode_add_order(stream + offset, output[count]);
-                    count++;
-                    break;
-                }
-                case 'E': {
-                    if (msg_len < ITCH_ORDER_EXECUTED_SIZE) { offset += msg_len; continue; }
-                    decode_execute(stream + offset, output[count]);
-                    count++;
-                    break;
-                }
-                case 'D': {
-                    if (msg_len < ITCH_ORDER_DELETE_SIZE) { offset += msg_len; continue; }
-                    decode_delete(stream + offset, output[count]);
-                    count++;
-                    break;
-                }
-                case 'U': {
-                    if (msg_len < ITCH_ORDER_REPLACE_SIZE) { offset += msg_len; continue; }
-                    decode_replace(stream + offset, output[count]);
-                    count++;
-                    break;
-                }
-                default:
-                    break;
+            char msg_type = static_cast<char>(stream[offset]);
+            DecodeFn handler = get_handler(msg_type);
+
+            if (handler && msg_len >= min_msg_size(msg_type)) {
+                handler(stream + offset, output[count]);
+                count++;
             }
+
             offset += msg_len;
         }
         return count;

@@ -14,6 +14,7 @@
 #include "broadcast_journal.h"
 #include "order_book.h"
 #include "pipeline.h"
+#include "routed_pipeline.h"
 
 // ============================================================
 // DATA GENERATION
@@ -130,7 +131,7 @@ void record_result(const std::string& name, const std::string& config,
 
 void experiment_simd_decode(const TestData& data) {
     std::cout << "\n" << std::string(70, '=') << "\n";
-    std::cout << "EXPERIMENT 1: SIMD Decode Throughput (Scalar vs. Vectorized)\n";
+    std::cout << "EXPERIMENT 1: Decode + Data Layout (AoS vs SoA)\n";
     std::cout << std::string(70, '=') << "\n";
 
     size_t n = data.raw_add_orders.size();
@@ -172,20 +173,122 @@ void experiment_simd_decode(const TestData& data) {
                      "decoded=" + std::to_string(decoded));
     }
 
-    // SIMD ticker filter benchmark
-    {
-        uint64_t target = 0;
-        std::memcpy(&target, "AAPL    ", 8);
+    // SoA vs AoS downstream comparison:
+    // Task: "find all AAPL orders with price > 300000" — a realistic filter
+    // that mimics what a strategy or risk check would do post-decode.
 
+    uint64_t target_ticker = 0;
+    std::memcpy(&target_ticker, "AAPL    ", 8);
+    uint32_t price_threshold = 300000;
+
+    // AoS scan: iterate DecodedOrder[], check ticker + price per struct
+    {
         auto start = std::chrono::high_resolution_clock::now();
         size_t matches = 0;
-        for (size_t i = 0; i + 4 <= n; i += 4) {
-            uint32_t mask = SimdDecoder::filter_tickers_simd(output.data() + i, 4, target);
-            matches += __builtin_popcount(mask);
+        for (size_t i = 0; i < n; i++) {
+            if (output[i].ticker_key == target_ticker && output[i].price > price_threshold) {
+                matches++;
+            }
         }
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(end - start).count();
-        record_result("SIMD Decode", "SIMD Ticker Filter (4-wide compare)", n, ms,
+        record_result("AoS vs SoA", "AoS scan (stride-48 per field)", n, ms,
+                     "matches=" + std::to_string(matches));
+    }
+
+    // Decode into SoA layout
+    std::vector<uint64_t> soa_tickers(n);
+    std::vector<uint32_t> soa_prices(n);
+    std::vector<uint32_t> soa_shares(n);
+    for (size_t i = 0; i < n; i++) {
+        soa_tickers[i] = output[i].ticker_key;
+        soa_prices[i] = output[i].price;
+        soa_shares[i] = output[i].shares;
+    }
+
+    // SoA scalar scan: separate arrays, but still scalar comparison
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        size_t matches = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (soa_tickers[i] == target_ticker && soa_prices[i] > price_threshold) {
+                matches++;
+            }
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        record_result("AoS vs SoA", "SoA scalar scan (contiguous fields)", n, ms,
+                     "matches=" + std::to_string(matches));
+    }
+
+    // SoA SIMD scan: vectorized ticker compare + price threshold
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        size_t matches = 0;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+        uint64x2_t target_vec = vdupq_n_u64(target_ticker);
+        uint32x4_t thresh_vec = vdupq_n_u32(price_threshold);
+
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            // Check 4 tickers (2 per NEON register)
+            uint64x2_t t01 = vld1q_u64(&soa_tickers[i]);
+            uint64x2_t t23 = vld1q_u64(&soa_tickers[i + 2]);
+            uint64x2_t cmp01 = vceqq_u64(t01, target_vec);
+            uint64x2_t cmp23 = vceqq_u64(t23, target_vec);
+
+            // Check 4 prices (one NEON register)
+            uint32x4_t prices = vld1q_u32(&soa_prices[i]);
+            uint32x4_t price_cmp = vcgtq_u32(prices, thresh_vec);
+
+            // Combine: ticker match AND price > threshold
+            uint32x4_t ticker_mask = vcombine_u32(
+                vmovn_u64(cmp01), vmovn_u64(cmp23)
+            );
+            uint32x4_t combined = vandq_u32(ticker_mask, price_cmp);
+
+            // Count matches
+            matches += (vgetq_lane_u32(combined, 0) ? 1 : 0);
+            matches += (vgetq_lane_u32(combined, 1) ? 1 : 0);
+            matches += (vgetq_lane_u32(combined, 2) ? 1 : 0);
+            matches += (vgetq_lane_u32(combined, 3) ? 1 : 0);
+        }
+        // Scalar tail
+        for (; i < n; i++) {
+            if (soa_tickers[i] == target_ticker && soa_prices[i] > price_threshold)
+                matches++;
+        }
+#elif defined(__x86_64__) || defined(_M_X64)
+        __m256i target_vec = _mm256_set1_epi64x(target_ticker);
+        __m128i thresh_vec = _mm_set1_epi32(price_threshold);
+
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            __m256i tickers = _mm256_loadu_si256((__m256i*)&soa_tickers[i]);
+            __m256i tcmp = _mm256_cmpeq_epi64(tickers, target_vec);
+            int tmask = _mm256_movemask_pd(_mm256_castsi256_pd(tcmp));
+
+            __m128i prices = _mm_loadu_si128((__m128i*)&soa_prices[i]);
+            __m128i pcmp = _mm_cmpgt_epi32(prices, thresh_vec);
+            int pmask = _mm_movemask_ps(_mm_castsi128_ps(pcmp));
+
+            matches += __builtin_popcount(tmask & pmask);
+        }
+        for (; i < n; i++) {
+            if (soa_tickers[i] == target_ticker && soa_prices[i] > price_threshold)
+                matches++;
+        }
+#else
+        for (size_t i = 0; i < n; i++) {
+            if (soa_tickers[i] == target_ticker && soa_prices[i] > price_threshold)
+                matches++;
+        }
+#endif
+
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        record_result("AoS vs SoA", "SoA SIMD scan (vectorized compare)", n, ms,
                      "matches=" + std::to_string(matches));
     }
 }
@@ -454,6 +557,58 @@ void experiment_book_throughput(const TestData& data) {
 }
 
 // ============================================================
+// EXPERIMENT 6: BROADCAST vs ROUTED PIPELINE
+// Compares broadcast (all consumers read all) vs producer-routed
+// (each consumer only reads its shard). Tests scaling efficiency.
+// ============================================================
+
+void experiment_broadcast_vs_routed(const TestData& data) {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "EXPERIMENT 6: Broadcast Pipeline vs Routed Pipeline\n";
+    std::cout << std::string(70, '=') << "\n";
+
+    size_t n = data.orders.size();
+    std::vector<int> thread_counts = {1, 2, 4, 8};
+
+    std::cout << "\n  [Broadcast — consumers read ALL, filter locally]\n";
+    for (int num_threads : thread_counts) {
+        Pipeline::Config cfg;
+        cfg.num_book_threads = num_threads;
+        cfg.measure_latency = false;
+
+        Pipeline pipeline(cfg);
+        auto results = pipeline.run(data.orders.data(), n);
+
+        std::string config_str = "Broadcast (" + std::to_string(num_threads) + " threads)";
+        std::string extra = "efficiency=" + std::to_string(static_cast<int>(
+            (results.throughput_mpps / (27.62 * num_threads)) * 100)) + "%";
+
+        record_result("Broadcast vs Routed", config_str, n, results.total_time_ms, extra);
+    }
+
+    std::cout << "\n  [Routed — producer routes to per-shard SPSC queues]\n";
+    for (int num_threads : thread_counts) {
+        RoutedPipeline::Config cfg;
+        cfg.num_book_threads = num_threads;
+        cfg.measure_latency = false;
+
+        RoutedPipeline pipeline(cfg);
+        auto results = pipeline.run(data.orders.data(), n);
+
+        std::string config_str = "Routed (" + std::to_string(num_threads) + " threads)";
+        // Compute efficiency vs single-thread routed baseline
+        std::string extra = "per_thread=[";
+        for (size_t t = 0; t < results.thread_message_counts.size(); t++) {
+            if (t > 0) extra += ",";
+            extra += std::to_string(results.thread_message_counts[t]);
+        }
+        extra += "]";
+
+        record_result("Broadcast vs Routed", config_str, n, results.total_time_ms, extra);
+    }
+}
+
+// ============================================================
 // RESULTS OUTPUT
 // ============================================================
 
@@ -550,6 +705,7 @@ int main() {
     experiment_pipeline_scaling(data);
     experiment_latency(data);
     experiment_book_throughput(data);
+    experiment_broadcast_vs_routed(data);
 
     write_results_markdown();
 

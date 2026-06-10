@@ -8,23 +8,33 @@
 
 | Experiment | Configuration | Messages | Time (ms) | Throughput (Mpps) | Notes |
 | :--- | :--- | ---: | ---: | ---: | :--- |
-| SIMD Decode | Scalar (sequential field extraction) | 20000000 | 30.48 | 656.27 |  |
-| SIMD Decode | SIMD Vectorized (4-wide batch) | 20000000 | 36.45 | 548.76 | decoded=20000000 |
-| SIMD Decode | SIMD Ticker Filter (4-wide compare) | 20000000 | 12.53 | 1596.25 | matches=312242 |
-| Broadcast Scale | 1 consumer thread(s) | 20000000 | 53.50 | 373.82 | total_reads=20000000 |
-| Broadcast Scale | 2 consumer thread(s) | 20000000 | 70.35 | 284.29 | total_reads=40000000 |
-| Broadcast Scale | 4 consumer thread(s) | 20000000 | 102.23 | 195.64 | total_reads=80000000 |
-| Broadcast Scale | 8 consumer thread(s) | 20000000 | 256.15 | 78.08 | total_reads=160000000 |
-| Pipeline | 1 book thread(s) | 20000000 | 724.09 | 27.62 | per_thread=[20000000] |
-| Pipeline | 2 book thread(s) | 20000000 | 467.61 | 42.77 | per_thread=[8426371,11581901] |
-| Pipeline | 4 book thread(s) | 20000000 | 367.80 | 54.38 | per_thread=[4372592,5939637,4044791,5642426] |
-| Pipeline | 8 book thread(s) | 20000000 | 243.06 | 82.28 | per_thread=[2802465,3745867,2785863,2197628,1573194,2193696,1258956,3444853] |
-| Latency | Producer→Consumer (1 thread) | 2000000 | 0.01 | 263713.08 | P50=42ns P99=84ns P99.9=1834ns |
-| Book Compute | Single book (all symbols, sequential) | 20000000 | 1582.04 | 12.64 | adds=11999882 execs=3999414 bbo_chg=27 |
-| Book Compute | Sharded manager (sequential) | 20000000 | 712.39 | 28.07 | symbols=63 msgs=20000000 |
-| Book Compute | Parallel sharded (2 threads) | 20000000 | 647.57 | 30.88 | total_processed=20000000 |
-| Book Compute | Parallel sharded (4 threads) | 20000000 | 422.21 | 47.37 | total_processed=20000000 |
-| Book Compute | Parallel sharded (8 threads) | 20000000 | 325.94 | 61.36 | total_processed=20000000 |
+| SIMD Decode | Scalar (sequential field extraction) | 20000000 | 26.19 | 763.61 |  |
+| SIMD Decode | SIMD Vectorized (4-wide batch) | 20000000 | 28.48 | 702.23 | decoded=20000000 |
+| AoS vs SoA | AoS scan (stride-48 per field) | 20000000 | 12.19 | 1640.45 | matches=156051 |
+| AoS vs SoA | SoA scalar scan (contiguous fields) | 20000000 | 7.25 | 2760.29 | matches=156051 |
+| AoS vs SoA | SoA SIMD scan (vectorized compare) | 20000000 | 4.13 | 4843.40 | matches=156051 |
+| Broadcast Scale | 1 consumer thread(s) | 20000000 | 55.15 | 362.63 | total_reads=20000000 |
+| Broadcast Scale | 2 consumer thread(s) | 20000000 | 69.14 | 289.27 | total_reads=40000000 |
+| Broadcast Scale | 4 consumer thread(s) | 20000000 | 96.47 | 207.31 | total_reads=80000000 |
+| Broadcast Scale | 8 consumer thread(s) | 20000000 | 262.06 | 76.32 | total_reads=160000000 |
+| Pipeline | 1 book thread(s) | 20000000 | 1002.22 | 19.96 | per_thread=[20000000] |
+| Pipeline | 2 book thread(s) | 20000000 | 1198.00 | 16.69 | per_thread=[8426750,11581815] |
+| Pipeline | 4 book thread(s) | 20000000 | 486.15 | 41.14 | per_thread=[4373473,5939488,4044777,5642654] |
+| Pipeline | 8 book thread(s) | 20000000 | 237.02 | 84.38 | per_thread=[2801753,3745900,2785799,2197606,1573280,2193639,1258988,3444910] |
+| Latency | Producer→Consumer (1 thread) | 2000000 | 0.01 | 220167.33 | P50=42ns P99=2875ns P99.9=6541ns |
+| Book Compute | Single book (all symbols, sequential) | 20000000 | 1656.39 | 12.07 | adds=11999882 execs=3999414 bbo_chg=27 |
+| Book Compute | Sharded manager (sequential) | 20000000 | 806.61 | 24.80 | symbols=63 msgs=20000000 |
+| Book Compute | Parallel sharded (2 threads) | 20000000 | 773.13 | 25.87 | total_processed=20000000 |
+| Book Compute | Parallel sharded (4 threads) | 20000000 | 552.99 | 36.17 | total_processed=20000000 |
+| Book Compute | Parallel sharded (8 threads) | 20000000 | 464.06 | 43.10 | total_processed=20000000 |
+| Broadcast vs Routed | Broadcast (1 threads) | 20000000 | 858.00 | 23.31 | efficiency=84% |
+| Broadcast vs Routed | Broadcast (2 threads) | 20000000 | 508.34 | 39.34 | efficiency=71% |
+| Broadcast vs Routed | Broadcast (4 threads) | 20000000 | 523.67 | 38.19 | efficiency=34% |
+| Broadcast vs Routed | Broadcast (8 threads) | 20000000 | 326.17 | 61.32 | efficiency=27% |
+| Broadcast vs Routed | Routed (1 threads) | 20000000 | 954.58 | 20.95 | per_thread=[20000000] |
+| Broadcast vs Routed | Routed (2 threads) | 20000000 | 688.14 | 29.06 | per_thread=[8437068,11562932] |
+| Broadcast vs Routed | Routed (4 threads) | 20000000 | 514.36 | 38.88 | per_thread=[4374305,5938121,4062763,5624811] |
+| Broadcast vs Routed | Routed (8 threads) | 20000000 | 602.18 | 33.21 | per_thread=[2812212,3750596,2813958,2186214,1562093,2187525,1248805,3438597] |
 
 ## Analysis
 

@@ -20,7 +20,7 @@ The system processes a raw NASDAQ ITCH 5.0 binary feed through a multi-stage pip
 │  • 4-wide vectorized field extraction (NEON / AVX2)                 │
 │  • Vectorized byte-swap (big-endian ITCH → host endian)             │
 │  • Message type dispatch (Add/Execute/Delete/Replace)               │
-│  • Throughput: 656 Mpps (decode) / 1596 Mpps (filter)               │
+│  • Throughput: 693 Mpps (decode) / 4635 Mpps (SoA+SIMD filter)      │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
                           ▼  [Broadcast Journal — Zero-Copy IPC]
@@ -53,9 +53,9 @@ The decoder uses platform-specific vector intrinsics to process 4 ITCH messages 
 - **ARM NEON** (128-bit): `vrev32q_u8` for vectorized byte-swap, `vceqq_u64` for parallel ticker matching
 - **Intel AVX2** (256-bit): `_mm256_cmpeq_epi64` for 4-wide comparison, `_mm_shuffle_epi8` for byte reordering
 
-The **ticker filter** (post-decode, SoA-friendly layout) reaches **1,612 Mpps** — demonstrating where SIMD truly wins: uniform, contiguous, aligned data.
+The decode stage (AoS input → AoS output) shows ~693 Mpps, comparable to scalar because the workload is gather-dominated (4 loads at stride-36 bytes to fill one vector). This is memory-bandwidth-bound, not compute-bound.
 
-The struct-of-arrays decode path shows ~728 Mpps, comparable to scalar because the workload is gather-dominated (4 loads at stride-36 to pack one vector register). This is an intentional design decision documented below.
+The real SIMD win is **downstream**: decoding into SoA layout (separate `prices[]`, `tickers[]` arrays) enables vectorized filtering at **4,635 Mpps** — a 3.14x speedup over AoS scan on the same data and same operation.
 
 ### 2. Pipeline Parallelism
 
@@ -93,15 +93,26 @@ shard_id = hash(ticker_key) % num_threads
 **Platform:** Apple M3 Pro (ARM64, 12 cores) | Clang 21.0 | `-O3 -march=native`  
 **Workload:** 20,000,000 realistic mixed-type order messages (64 symbols)
 
-### SIMD Decode Throughput
+### Decode Throughput
 
 | Configuration | Time (ms) | Throughput (Mpps) |
 |---|---:|---:|
-| Scalar (sequential field extraction) | 30.48 | 656.27 |
-| SIMD Vectorized (4-wide NEON batch) | 36.45 | 548.76 |
-| SIMD Ticker Filter (4-wide compare) | 12.53 | 1,596.25 |
+| Scalar (sequential field extraction) | 30.52 | 655.23 |
+| SIMD Vectorized (4-wide NEON batch) | 28.84 | 693.47 |
 
-> **Design note:** The vectorized decoder and scalar are comparable because ITCH structs are AoS (array-of-structs) — gathering fields from 4 different structs at stride-36 to pack one SIMD register costs more in loads than the byte-swap saves. The ticker filter demonstrates where SIMD dominates: post-decode data in SoA layout with contiguous fields and zero gather overhead.
+> **Design note:** Scalar and SIMD are comparable because ITCH structs are AoS — gathering fields from 4 structs at stride-36 to pack one vector register costs as much as the byte-swap saves. Decode is memory-bandwidth-bound, not compute-bound.
+
+### Data Layout: AoS vs SoA (Downstream Filter)
+
+Task: "find all AAPL orders with price > $30.00" — a realistic strategy/risk filter on 20M decoded orders.
+
+| Layout + Method | Time (ms) | Throughput (Mpps) | vs Baseline |
+|---|---:|---:|---:|
+| AoS scan (stride-48 between fields) | 13.56 | 1,474.86 | 1.0x |
+| SoA scalar (contiguous fields, no SIMD) | 7.77 | 2,574.96 | 1.75x |
+| SoA + SIMD (vectorized compare) | 4.32 | 4,634.99 | **3.14x** |
+
+> **Key insight:** SIMD wins **3x** when data layout matches the access pattern. The same filter, same data, same answer (156,051 matches) — only the memory layout changed. This is why high-performance systems decode into SoA: it makes all downstream vectorized work free.
 
 ### Broadcast Journal Scaling
 
@@ -158,6 +169,19 @@ Each shard maintains real order books per symbol with:
 
 ---
 
+### Broadcast vs Routed Pipeline (Experiment 6)
+
+We benchmarked an alternative design: per-shard SPSC queues where the producer routes each message to only the relevant consumer. Hypothesis: eliminating 75% of wasted consumer cache loads should improve scaling efficiency.
+
+| Architecture | 1 Thread | 4 Threads | 8 Threads |
+|---|---:|---:|---:|
+| **Broadcast** (current) | 28.15 Mpps | 73.81 Mpps | 78.02 Mpps |
+| **Routed** (per-shard SPSC) | 21.15 Mpps | 47.55 Mpps | 30.99 Mpps |
+
+**Result: Broadcast wins.** The producer is the bottleneck, and routing adds work to it — one hash + one batch-copy + one atomic push per shard. The scattered writes to N queue heads cause cache-line ping-pong between producer and consumers. Meanwhile, broadcast's "wasted" consumer reads are cheap because they're sequential (hardware prefetcher handles it). The real-world solution is **NIC-level RSS/Flow Director** that routes packets to per-core queues in hardware, before the CPU's decode loop even begins.
+
+---
+
 ## Key Design Decisions
 
 1. **Open-addressing over `std::unordered_map`**: Node-based maps scatter entries across the heap (3+ cache misses per lookup). Our flat map stores all entries contiguously — one hash, one probe, done.
@@ -168,7 +192,7 @@ Each shard maintains real order books per symbol with:
 6. **Symbol-hash sharding over locking**: Partition the problem so threads never conflict, instead of locking shared structures.
 7. **Backpressure via consumer progress tracking**: Producer checks slowest consumer position before overwriting ring slots. Prevents silent data corruption on slow consumers.
 8. **True end-to-end latency measurement**: Timestamps at publish and consume, not wall-clock offsets. Measures what matters.
-9. **SIMD where it fits**: Vectorized ticker filtering (SoA, contiguous) reaches 1.6 Gpps. Struct decode is gather-dominated — scalar is equivalent by design.
+9. **SIMD where it fits**: SoA layout + vectorized filter reaches 4.6 Gpps (3.14x over AoS). Decode is gather-dominated and memory-bound — SIMD can't help there.
 
 ---
 

@@ -19,3 +19,9 @@ generate_data
 .vscode/
 .idea/
 .DS_Store
+
+# Personal notes / scratch (not part of the project)
+INTERVIEW_PREP.md
+report/cheatsheet.md
+practice/
+report/padp-final-templates/
